@@ -4,6 +4,7 @@
 #include "champsim.h"
 #include "instruction.h"
 #include "set.h"
+#include "offchip_pred_base_helper.h"
 
 // CACHE BLOCK
 class BLOCK {
@@ -145,6 +146,8 @@ class PACKET {
              ip, 
              event_cycle,
              cycle_enqueued;
+    
+    uint8_t went_offchip_pred;
 
     PACKET() {
         instruction = 0;
@@ -215,6 +218,8 @@ class PACKET {
         l1_pq_index = -1;
     	full_physical_address = 0;
 	send_both_tlb = false;
+
+    went_offchip_pred = 0;
     };
 };
 
@@ -394,6 +399,10 @@ class LSQ_ENTRY {
 // forwarding_depend_on_me[ROB_SIZE];
     fastset
 		forwarding_depend_on_me;
+    
+    uint8_t went_offchip; // 1 => this request went to DRAM
+    uint8_t went_offchip_pred; // predicted to go off-chip
+    ocp_base_feature_t *ocp_feature;    
 
     // constructor
     LSQ_ENTRY() {
@@ -413,6 +422,9 @@ class LSQ_ENTRY {
         asid[0] = UINT8_MAX;
         asid[1] = UINT8_MAX;
 
+        went_offchip = 0;
+        went_offchip_pred = 0;
+        ocp_feature = NULL;        
 #if 0
         for (uint32_t i=0; i<ROB_SIZE; i++)
             forwarding_depend_on_me[i] = 0;

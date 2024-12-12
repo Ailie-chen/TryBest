@@ -1,11 +1,12 @@
 #ifndef CACHE_H
 #define CACHE_H
-
+#include "dram_controller.h"
 #include "memory_class.h"
 //#define PREFETCHER_CLASS_DEBUG
 //#define MEMORY_ACCESS_PATTERN_DEBUG
 extern bool spec_intructions_complete;
 extern bool spec_intructions_complete_for_l2c;
+
 #ifdef MEMORY_ACCESS_PATTERN_DEBUG
     #include<unordered_map>
     typedef struct act_ValuePair_struct
@@ -190,6 +191,7 @@ extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
 // #define LLC_MSHR_SIZE NUM_CPUS*64
 // #define LLC_LATENCY 30  // 5 (L1I or L1D) + 10 + 20 = 35 cycles
 
+extern MEMORY_CONTROLLER *dram_controller;
 class CACHE : public MEMORY {
   public:
     uint32_t cpu;

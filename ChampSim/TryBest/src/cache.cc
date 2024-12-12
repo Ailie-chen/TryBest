@@ -29,6 +29,11 @@ vector <uint64_t> regions_accessed, total_regions;                             /
 //Neelu: Not sending translation requests to STLB for L1D same page prefetch requests
 //#define NO_TRANSLATION_PENALTY_FOR_PREFETCHES
 
+namespace knob
+{
+     extern bool enable_ddrp ;
+     extern uint32_t ddrp_req_latency;
+}
 
 ostream& operator<<(ostream& os, const PACKET &packet)
 {
@@ -1365,6 +1370,7 @@ void CACHE::handle_processed()
     //@Vishal: Check for Prefetch translations from STLB processed queue
     if(cache_type == IS_L1D)
     {
+
         CACHE &tlb = ooo_cpu[cpu].STLB;
 
         //@Vishal: one translation is processed per cycle
@@ -1435,6 +1441,7 @@ void CACHE::handle_processed()
 
 void CACHE::handle_read()
 {
+
     if(cache_type == IS_L1D) {
         //	cout << "Handle read cycle: " << current_core_cycle[cpu] << "PQ Occupancy: " << PQ.occupancy << endl;
         sum_pq_occupancy += PQ.occupancy;
@@ -1452,6 +1459,28 @@ if(cache_type == IS_L1I || cache_type == IS_L1D) //Get completed index in RQ, as
         if(RQ.entry[rq_index].translated == COMPLETED && (RQ.entry[rq_index].event_cycle <= current_core_cycle[cpu])) 
         {
             reads_ready.insert({RQ.entry[rq_index].event_cycle, rq_index});
+            if(RQ.entry[rq_index].went_offchip_pred && knob::enable_ddrp && cache_type == IS_L1D){
+                assert(RQ.entry[rq_index].translated == COMPLETED);
+                assert(RQ.entry[rq_index].full_physical_address != 0);
+            // data_packet.rob_position = LQ.entry[lq_index].rob_position;
+                PACKET data_packet;
+                data_packet.fill_level = FILL_DDRP;
+                data_packet.fill_l1d = 0;
+                data_packet.cpu = cpu;
+                data_packet.data_index = RQ.entry[rq_index].data_index;
+                data_packet.lq_index = RQ.entry[rq_index].lq_index;
+                data_packet.address = RQ.entry[rq_index].full_physical_address >> LOG2_BLOCK_SIZE;
+                data_packet.full_addr = RQ.entry[rq_index].full_physical_address;
+                data_packet.instr_id = RQ.entry[rq_index].instr_id;
+                data_packet.rob_index = RQ.entry[rq_index].rob_index;
+                // data_packet.rob_position = RQ.entry[rq_index].rob_position;
+                data_packet.ip = RQ.entry[rq_index].ip;
+                data_packet.type = PREFETCH;
+                data_packet.asid[0] = RQ.entry[rq_index].asid[0];
+                data_packet.asid[1] = RQ.entry[rq_index].asid[1];
+                data_packet.event_cycle = RQ.entry[rq_index].event_cycle + knob::ddrp_req_latency;
+                dram_controller->add_rq(&data_packet);
+            }
         }
 
 }

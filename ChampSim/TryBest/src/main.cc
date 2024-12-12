@@ -1270,6 +1270,9 @@ int main(int argc, char** argv)
         // BRANCH PREDICTOR
         ooo_cpu[i].initialize_branch_predictor();
 
+        // OFFCHIP PREDICTOR
+        ooo_cpu[i].initialize_offchip_predictor(champsim_seed);
+
 		ooo_cpu[i].BTB.cpu = i;
 		ooo_cpu[i].BTB.cache_type = IS_BTB;
 
@@ -1411,6 +1414,8 @@ int main(int argc, char** argv)
             uncore.DRAM.RQ[i].is_RQ = 1;
             uncore.DRAM.WQ[i].is_WQ = 1;
         }
+        uncore.DRAM.init_ddrp_buffer();
+        ooo_cpu[i].dram_controller = &uncore.DRAM;
 
         warmup_complete[i] = 0;
         //all_warmup_complete = NUM_CPUS;

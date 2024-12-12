@@ -82,6 +82,7 @@
 #define FILL_STLB  2
 #define FILL_LLC   4
 #define FILL_DRC   8
+#define FILL_DDRP  9
 #define FILL_DRAM 16
 
 //Context-switch

@@ -2,7 +2,11 @@
 #define OOO_CPU_H
 
 #include "cache.h"
+#include "dram_controller.h"
 #include "page_table_walker.h"
+#include "offchip_pred_base.h"
+#include "ddrp_monitor.h"
+#include "offchip_tracer.h"
 
 #ifdef CRC2_COMPILE
 #define STAT_PRINTING_PERIOD 1000000
@@ -109,8 +113,16 @@ class O3_CPU {
     CACHE DTLB_PB{"DTLB_PB", DTLB_PB_SET, DTLB_PB_WAY, DTLB_PB_SET*DTLB_PB_WAY, DTLB_PB_WQ_SIZE, DTLB_PB_RQ_SIZE, DTLB_PB_PQ_SIZE, DTLB_PB_MSHR_SIZE};
     #endif
 
+    // DRAM controller pointer for DDRP
+    MEMORY_CONTROLLER *dram_controller;
+    
     PAGE_TABLE_WALKER PTW{"PTW"}; 
+    
+    // off-chip predictor
+    OffchipPredBase *offchip_pred;
 
+    // Offchip tracer
+    OffchipTracer tracer;
     // constructor
     O3_CPU() {
         cpu = 0;
@@ -246,6 +258,18 @@ class O3_CPU {
      int prefetch_code_line(uint64_t pf_v_addr);
 
 void fill_btb(uint64_t trigger, uint64_t target);
+  // OFFCHIP PREDICTOR
+  void offchip_pred_stats_and_train(uint32_t lq_index);
+  void  initialize_offchip_predictor(uint64_t seed),
+        dump_stats_offchip_predictor(),
+        print_config_offchip_predictor(),
+        offchip_predictor_update_dram_bw(uint8_t dram_bw),
+        offchip_predictor_track_llc_eviction(uint32_t set, uint32_t way, uint64_t address);
+
+  // DDRP 
+  void issue_ddrp_request(uint32_t lq_index, uint32_t call_type);
+  void initialize_ddrp_monitor(),
+       print_config_ddrp_monitor();
 
 };
 

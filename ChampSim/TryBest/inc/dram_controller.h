@@ -37,7 +37,7 @@ class MEMORY_CONTROLLER : public MEMORY {
 
     // queues
     PACKET_QUEUE WQ[DRAM_CHANNELS], RQ[DRAM_CHANNELS];
-
+vector<deque<uint64_t> > ddrp_buffer;
     // constructor
     MEMORY_CONTROLLER(string v1) : NAME (v1) {
         for (uint32_t i=0; i<NUM_TYPES+1; i++) {
@@ -104,6 +104,11 @@ class MEMORY_CONTROLLER : public MEMORY {
     uint64_t get_bank_earliest_cycle();
 
     int check_dram_queue(PACKET_QUEUE *queue, PACKET *packet);
+    // DDRP buffer
+    void init_ddrp_buffer();
+    void insert_ddrp_buffer(uint64_t address);
+    bool lookup_ddrp_buffer(uint64_t address);
+    uint32_t get_ddrp_buffer_set_index(uint64_t address);
 };
 
 #endif

@@ -16,7 +16,17 @@ uint8_t UNIQUE_ASID[5];
 int asid_index=0;
 
 int reg_instruction_pointer = REG_INSTRUCTION_POINTER, reg_flags = REG_FLAGS, reg_stack_pointer = REG_STACK_POINTER;
-
+namespace knob
+{
+     bool cloudsuite;
+     uint32_t load_hit_dependency_max_level;
+     uint32_t num_rob_partitions;
+     bool enable_ddrp = true;
+     bool offchip_pred_mark_merged_load;
+     uint32_t ddrp_req_latency = 0;
+     bool enable_ddrp_monitor = true;
+     bool     enable_offchip_tracing;
+}
 
 void O3_CPU::initialize_core()
 {
@@ -1562,6 +1572,8 @@ void O3_CPU::add_load_queue(uint32_t rob_index, uint32_t data_index)
     LQ.entry[lq_index].asid[0] = ROB.entry[rob_index].asid[0];
     LQ.entry[lq_index].asid[1] = ROB.entry[rob_index].asid[1];
     LQ.entry[lq_index].event_cycle = current_core_cycle[cpu] + SCHEDULING_LATENCY;
+    bool predict_offchip = offchip_pred->predict(&ROB.entry[rob_index], data_index, &LQ.entry[lq_index]);
+    LQ.entry[lq_index].went_offchip_pred = offchip_pred->predict(&ROB.entry[rob_index], data_index, &LQ.entry[lq_index]);
     LQ.occupancy++;
 
     // check RAW dependency
@@ -2106,6 +2118,7 @@ int O3_CPU::execute_load(uint32_t rob_index, uint32_t lq_index, uint32_t data_in
 
     data_packet.instr_id = LQ.entry[lq_index].instr_id;
     data_packet.rob_index = LQ.entry[lq_index].rob_index;
+    data_packet.went_offchip_pred = LQ.entry[lq_index].went_offchip_pred;
     data_packet.ip = LQ.entry[lq_index].ip;
 
     data_packet.type = LOAD;
@@ -2393,6 +2406,7 @@ void O3_CPU::complete_instr_fetch(PACKET_QUEUE *queue, uint8_t is_it_tlb)
 void O3_CPU::complete_data_fetch(PACKET_QUEUE *queue, uint8_t is_it_tlb)
 {
 
+    
 	//@Vishal: VIPT, TLB request should not be handled here
 	assert(is_it_tlb == 0);
 
@@ -2401,6 +2415,8 @@ void O3_CPU::complete_data_fetch(PACKET_QUEUE *queue, uint8_t is_it_tlb)
              rob_index = queue->entry[index].rob_index,
              sq_index = queue->entry[index].sq_index,
              lq_index = queue->entry[index].lq_index;
+
+    
 
 #ifdef SANITY_CHECK
     if (queue->entry[index].type != RFO) {
@@ -2444,6 +2460,8 @@ void O3_CPU::complete_data_fetch(PACKET_QUEUE *queue, uint8_t is_it_tlb)
             if (RTL1_tail == LQ_SIZE)
                 RTL1_tail = 0;
 
+             
+            
             //DP (if (warmup_complete[cpu]) {
             //cout << "[RTL1] " << __func__ << " instr_id: " << LQ.entry[lq_index].instr_id << " rob_index: " << LQ.entry[lq_index].rob_index << " is added to RTL1";
             //cout << " head: " << RTL1_head << " tail: " << RTL1_tail << endl; }); 
@@ -2453,7 +2471,8 @@ void O3_CPU::complete_data_fetch(PACKET_QUEUE *queue, uint8_t is_it_tlb)
             //cout << " DTLB_FETCH_DONE translation: " << +LQ.entry[lq_index].translated << hex << " page: " << (LQ.entry[lq_index].physical_address>>LOG2_PAGE_SIZE);
             //cout << " full_addr: " << LQ.entry[lq_index].physical_address << dec << " store_merged: " << +queue->entry[index].store_merged;
             //cout << " load_merged: " << +queue->entry[index].load_merged << endl; }); 
-
+            
+            
             handle_merged_translation(&queue->entry[index]);
         }
 
@@ -2628,7 +2647,11 @@ void O3_CPU::handle_merged_translation(PACKET *provider)
                 RTL1_tail = 0;
 
             //DP (if (warmup_complete[cpu]) {
-            //cout << "[RTL1] " << __func__ << " instr_id: " << LQ.entry[merged].instr_id << " rob_index: " << LQ.entry[merged].rob_index << " is added to RTL1";
+            
+            if(LQ.entry[merged].went_offchip_pred && knob::enable_ddrp)
+            {
+                issue_ddrp_request(merged, 1);
+            }            //cout << "[RTL1] " << __func__ << " instr_id: " << LQ.entry[merged].instr_id << " rob_index: " << LQ.entry[merged].rob_index << " is added to RTL1";
             //cout << " head: " << RTL1_head << " tail: " << RTL1_tail << endl; }); 
 
             //DP (if (warmup_complete[cpu]) {
@@ -2646,7 +2669,8 @@ void O3_CPU::handle_merged_load(PACKET *provider)
 
         LQ.entry[merged].fetched = COMPLETED;
         LQ.entry[merged].event_cycle = current_core_cycle[cpu];
-     
+
+        // LQ.entry[merged].went_offchip = LQ.entry[provider->lq_index].went_offchip; // if provider went offchip, mark merged LQ entry offchip
 	ROB.entry[merged_rob_index].num_mem_ops--;
         ROB.entry[merged_rob_index].event_cycle = current_core_cycle[cpu];
 
@@ -2675,6 +2699,14 @@ void O3_CPU::release_load_queue(uint32_t lq_index)
     //DP ( if (warmup_complete[cpu]) {
     //cout << "[LQ] " << __func__ << " instr_id: " << LQ.entry[lq_index].instr_id << " releases lq_index: " << lq_index;
     //cout << hex << " full_addr: " << LQ.entry[lq_index].physical_address << dec << endl; });
+    // offchip_predictor stats collection and training
+    offchip_pred_stats_and_train(lq_index);
+
+    // dellocate ocp feature
+    if(LQ.entry[lq_index].ocp_feature)
+    {
+        delete LQ.entry[lq_index].ocp_feature;
+    }
 
     LSQ_ENTRY empty_entry;
     LQ.entry[lq_index] = empty_entry;
@@ -2730,6 +2762,7 @@ void O3_CPU::retire_rob()
 
                         data_packet.instr_id = SQ.entry[sq_index].instr_id;
                         data_packet.rob_index = SQ.entry[sq_index].rob_index;
+                        data_packet.went_offchip_pred = SQ.entry[sq_index].went_offchip_pred;
                         data_packet.ip = SQ.entry[sq_index].ip;
                         data_packet.type = RFO;
                         data_packet.asid[0] = SQ.entry[sq_index].asid[0];
@@ -2801,3 +2834,86 @@ void O3_CPU::core_final_stats()
 }
 
 
+void O3_CPU::offchip_pred_stats_and_train(uint32_t lq_index)
+{
+    // stats
+    if(LQ.entry[lq_index].went_offchip == 1 && LQ.entry[lq_index].went_offchip_pred == 1) // true positive
+    {
+        // stats.offchip_pred.true_pos++;
+    }
+    else if(LQ.entry[lq_index].went_offchip == 0 && LQ.entry[lq_index].went_offchip_pred == 1) // false negative
+    {
+        // stats.offchip_pred.false_pos++;
+    }
+    else if(LQ.entry[lq_index].went_offchip == 1 && LQ.entry[lq_index].went_offchip_pred == 0) // false negative
+    {
+        // stats.offchip_pred.false_neg++;
+    }
+
+    // training
+    uint32_t rob_index = LQ.entry[lq_index].rob_index;
+    int32_t data_index = -1;
+    for(int32_t index = 0; index < NUM_INSTR_SOURCES; ++index)
+    {
+        if(ROB.entry[rob_index].lq_index[index] == lq_index)
+        {
+            data_index = index;
+            break;
+        }
+    }
+    assert(data_index != -1);
+    offchip_pred->train(&ROB.entry[rob_index], (uint32_t)data_index, &LQ.entry[lq_index]);
+}
+
+void O3_CPU::issue_ddrp_request(uint32_t lq_index, uint32_t call_type)
+{
+    // stats.ddrp.total++;
+    assert(LQ.entry[lq_index].translated == COMPLETED);
+    assert(LQ.entry[lq_index].physical_address != 0);
+    // assert(knob::enable_ddrp);
+
+    // check if DDRP is forcefully disabled by DDRP monitor
+    // if(ddrp_monitor && ddrp_monitor->disable_ddrp == true)
+    // {
+    //     return;
+    // }
+
+    // if(dram_controller->get_occupancy(1, LQ.entry[lq_index].physical_address >> LOG2_BLOCK_SIZE) == dram_controller->get_size(1, LQ.entry[lq_index].physical_address >> LOG2_BLOCK_SIZE)) // check RQ's occupancy
+    // {
+    //     stats.ddrp.dram_rq_full++;
+    //     return;
+    // }
+    
+    // add it to DRAM_CONTROLLER's MSHR
+    PACKET data_packet;
+    data_packet.fill_level = FILL_DDRP;
+    data_packet.fill_l1d = 0;
+    data_packet.cpu = cpu;
+    data_packet.data_index = LQ.entry[lq_index].data_index;
+    data_packet.lq_index = lq_index;
+    data_packet.address = LQ.entry[lq_index].physical_address >> LOG2_BLOCK_SIZE;
+    data_packet.full_addr = LQ.entry[lq_index].physical_address;
+    data_packet.instr_id = LQ.entry[lq_index].instr_id;
+    data_packet.rob_index = LQ.entry[lq_index].rob_index;
+    // data_packet.rob_position = LQ.entry[lq_index].rob_position;
+    data_packet.ip = LQ.entry[lq_index].ip;
+    data_packet.type = PREFETCH;
+    data_packet.asid[0] = LQ.entry[lq_index].asid[0];
+    data_packet.asid[1] = LQ.entry[lq_index].asid[1];
+    data_packet.event_cycle = LQ.entry[lq_index].event_cycle + knob::ddrp_req_latency;
+
+    // DDRP_DP ( if(warmup_complete[data_packet.cpu]){
+    // cout << "[CORE_DDRP_REQ] " <<  __func__ << " instr_id: " << data_packet.instr_id << " address: " << hex << data_packet.address;
+    // cout << " full_addr: " << data_packet.full_addr << dec;
+    // cout << " current: " << current_core_cycle[data_packet.cpu] << " event: " << data_packet.event_cycle << endl;});
+
+    dram_controller->add_rq(&data_packet);
+}
+
+// void O3_CPU::initialize_ddrp_monitor()
+// {
+//     if(knob::enable_ddrp_monitor)
+//     {
+//         ddrp_monitor = new DDRPMonitor(cpu);
+//     }
+// }

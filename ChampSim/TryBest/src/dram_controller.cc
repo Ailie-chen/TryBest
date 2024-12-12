@@ -1,4 +1,9 @@
+#include <algorithm>
 #include "dram_controller.h"
+#include "cache.h"
+#include "ooo_cpu.h"
+#include "uncore.h"
+#include "util.h"
 
 // initialized in main.cc
 uint32_t DRAM_MTPS, DRAM_DBUS_RETURN_TIME,
@@ -361,7 +366,27 @@ void MEMORY_CONTROLLER::schedule(PACKET_QUEUE *queue)
                  op_row = dram_get_row(op_addr);
 #ifdef DEBUG_PRINT
         uint32_t op_column = dram_get_column(op_addr);
-#endif
+#endif // model pseudo direct DRAM prefetch
+        if(queue->entry[oldest_index].is_data)
+        {
+            // model only for loads, and also for prefetch requests if enabled
+            if(queue->entry[oldest_index].type == LOAD || (queue->entry[oldest_index].type == PREFETCH ))
+            {
+                
+                uint64_t on_chip_cache_lookup_lat = L1D_LATENCY + L2C_LATENCY + LLC_LATENCY;
+                if(LATENCY > on_chip_cache_lookup_lat)
+                {
+                    LATENCY = LATENCY - on_chip_cache_lookup_lat;
+                }
+                else
+                {
+                    // the real headroom might be even higher than this
+                    // when total on-chip cache lookup latency will be much higher 
+                    // than the row buffer hit latency
+                    LATENCY = 0;
+                }
+            }
+        }
 
         // this bank is now busy
         bank_request[op_channel][op_rank][op_bank].working = 1;
@@ -461,7 +486,12 @@ void MEMORY_CONTROLLER::process(PACKET_QUEUE *queue)
                 cout << " current_cycle: " << current_core_cycle[op_cpu] << " event_cycle: " << queue->entry[request_index].event_cycle << endl; });
 
                 // send data back to the core cache hierarchy
-                upper_level_dcache[op_cpu]->return_data(&queue->entry[request_index]);
+                if(queue->entry[request_index].fill_level < FILL_DDRP)
+                {                
+                    upper_level_dcache[op_cpu]->return_data(&queue->entry[request_index]);
+                }else{
+                    insert_ddrp_buffer(op_addr);
+                }
 
                 if (bank_request[op_channel][op_rank][op_bank].row_buffer_hit)
                     queue->ROW_BUFFER_HIT++;
@@ -545,6 +575,12 @@ void MEMORY_CONTROLLER::process(PACKET_QUEUE *queue)
 
 int MEMORY_CONTROLLER::add_rq(PACKET *packet)
 {
+    bool return_data_to_core = true;
+    if(packet->fill_level >= FILL_DDRP)
+    {
+        return_data_to_core = false;
+    }
+
     // simply return read requests with dummy response before the warmup
     if (all_warmup_complete < NUM_CPUS) {
         if (packet->instruction) 
@@ -583,7 +619,22 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
 
         return -1;
     }
+    bool hit = lookup_ddrp_buffer(packet->address);
+    if(hit)
+    {
+        // RBERA_TODO: do we want to model latency here?
+        if (return_data_to_core) 
+        {
+            // RBERA_TODO: what should be the data payload of the packet?
+            if (packet->instruction) 
+                upper_level_icache[packet->cpu]->return_data(packet);
+            if (packet->is_data) 
+                upper_level_dcache[packet->cpu]->return_data(packet);
+        }
 
+
+        return -1;
+    }
     // check for duplicates in the read queue
     int index = check_dram_queue(&RQ[channel], packet);
     if (index != -1)
@@ -888,4 +939,48 @@ void MEMORY_CONTROLLER::print_DRAM_busy_stats()
 			}
 		}
 	}
+}
+
+/* DDRP BUFFER */
+
+void MEMORY_CONTROLLER::init_ddrp_buffer()
+{
+    // init buffer
+    ddrp_buffer.clear();
+    deque<uint64_t> d;
+    ddrp_buffer.resize(64, d);
+}
+
+void MEMORY_CONTROLLER::insert_ddrp_buffer(uint64_t addr)
+{
+
+    uint32_t set = get_ddrp_buffer_set_index(addr);
+    auto it = find_if(ddrp_buffer[set].begin(), ddrp_buffer[set].end(), [addr](uint64_t m_addr){return m_addr == addr;});
+    if(it != ddrp_buffer[set].end())
+    {
+        ddrp_buffer[set].erase(it);
+        ddrp_buffer[set].push_back(addr);
+    }
+    else
+    {
+        if(ddrp_buffer[set].size() >= 16)
+        {
+            ddrp_buffer[set].pop_front();
+        }
+        ddrp_buffer[set].push_back(addr);
+    }
+}
+
+bool MEMORY_CONTROLLER::lookup_ddrp_buffer(uint64_t addr)
+{
+    uint32_t set = get_ddrp_buffer_set_index(addr);
+    auto it = find_if(ddrp_buffer[set].begin(), ddrp_buffer[set].end(), [addr](uint64_t m_addr){return m_addr == addr;});
+
+}
+
+uint32_t MEMORY_CONTROLLER::get_ddrp_buffer_set_index(uint64_t address)
+{
+    uint32_t hash = folded_xor(address, 2);
+    hash = HashZoo::getHash(2, hash);
+    return (hash % 64);
 }
