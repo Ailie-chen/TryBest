@@ -7,6 +7,10 @@
 #include "offchip_pred_base.h"
 #include "ddrp_monitor.h"
 #include "offchip_tracer.h"
+#include "commons.h"
+#include <bitset>
+#include <unordered_map>
+#include <vector>
 
 #ifdef CRC2_COMPILE
 #define STAT_PRINTING_PERIOD 1000000
@@ -37,7 +41,37 @@ using namespace std;
 extern uint32_t SCHEDULING_LATENCY, EXEC_LATENCY, DECODE_LATENCY;
 extern uint8_t TRACE_ENDS_STOP;
 
+namespace knob
+{
+    extern uint32_t num_rob_partitions;
+}
 
+class load_per_ip_info_t
+{
+public:
+    uint64_t total_loads;
+    uint64_t loads_went_offchip;
+    vector<uint64_t> loads_went_offchip_pos_hist; // histogram of offchip loads based on dispatch position
+    load_per_ip_info_t()
+    {
+        total_loads = 0;
+        loads_went_offchip = 0;
+        loads_went_offchip_pos_hist.resize(knob::num_rob_partitions, 0);
+    }
+};
+
+class load_per_rob_part_info_t
+{
+public:
+    uint64_t total_loads;
+    uint64_t loads_went_offchip;
+    void reset()
+    {
+        total_loads = 0;
+        loads_went_offchip = 0;        
+    }
+    load_per_rob_part_info_t() {reset();}
+};
 
 // cpu
 class O3_CPU {
@@ -101,13 +135,13 @@ class O3_CPU {
              sim_store_sent, roi_store_sent; //Stores sent to L1D cache
 
     // TLBs and caches
-    CACHE ITLB{"ITLB", ITLB_SET, ITLB_WAY, ITLB_SET*ITLB_WAY, ITLB_WQ_SIZE, ITLB_RQ_SIZE, ITLB_PQ_SIZE, ITLB_MSHR_SIZE},
-          DTLB{"DTLB", DTLB_SET, DTLB_WAY, DTLB_SET*DTLB_WAY, DTLB_WQ_SIZE, DTLB_RQ_SIZE, DTLB_PQ_SIZE, DTLB_MSHR_SIZE},
-          STLB{"STLB", STLB_SET, STLB_WAY, STLB_SET*STLB_WAY, STLB_WQ_SIZE, STLB_RQ_SIZE, STLB_PQ_SIZE, STLB_MSHR_SIZE},
-          L1I{"L1I", L1I_SET, L1I_WAY, L1I_SET*L1I_WAY, L1I_WQ_SIZE, L1I_RQ_SIZE, L1I_PQ_SIZE, L1I_MSHR_SIZE},
-          L1D{"L1D", L1D_SET, L1D_WAY, L1D_SET*L1D_WAY, L1D_WQ_SIZE, L1D_RQ_SIZE, L1D_PQ_SIZE, L1D_MSHR_SIZE},
-          L2C{"L2C", L2C_SET, L2C_WAY, L2C_SET*L2C_WAY, L2C_WQ_SIZE, L2C_RQ_SIZE, L2C_PQ_SIZE, L2C_MSHR_SIZE},
-		  BTB{"BTB", BTB_SET, BTB_WAY, BTB_SET*BTB_WAY, 0, 0, 0, 0};
+    CACHE ITLB{"ITLB", ITLB_SET, ITLB_WAY, ITLB_SET*ITLB_WAY, ITLB_WQ_SIZE, ITLB_RQ_SIZE, ITLB_PQ_SIZE, ITLB_MSHR_SIZE,NULL},
+          DTLB{"DTLB", DTLB_SET, DTLB_WAY, DTLB_SET*DTLB_WAY, DTLB_WQ_SIZE, DTLB_RQ_SIZE, DTLB_PQ_SIZE, DTLB_MSHR_SIZE,NULL},
+          STLB{"STLB", STLB_SET, STLB_WAY, STLB_SET*STLB_WAY, STLB_WQ_SIZE, STLB_RQ_SIZE, STLB_PQ_SIZE, STLB_MSHR_SIZE,NULL},
+          L1I{"L1I", L1I_SET, L1I_WAY, L1I_SET*L1I_WAY, L1I_WQ_SIZE, L1I_RQ_SIZE, L1I_PQ_SIZE, L1I_MSHR_SIZE,NULL},
+          L1D{"L1D", L1D_SET, L1D_WAY, L1D_SET*L1D_WAY, L1D_WQ_SIZE, L1D_RQ_SIZE, L1D_PQ_SIZE, L1D_MSHR_SIZE,this},
+          L2C{"L2C", L2C_SET, L2C_WAY, L2C_SET*L2C_WAY, L2C_WQ_SIZE, L2C_RQ_SIZE, L2C_PQ_SIZE, L2C_MSHR_SIZE,NULL},
+		  BTB{"BTB", BTB_SET, BTB_WAY, BTB_SET*BTB_WAY, 0, 0, 0, 0,NULL};
 
     #ifdef PUSH_DTLB_PB
     CACHE DTLB_PB{"DTLB_PB", DTLB_PB_SET, DTLB_PB_WAY, DTLB_PB_SET*DTLB_PB_WAY, DTLB_PB_WQ_SIZE, DTLB_PB_RQ_SIZE, DTLB_PB_PQ_SIZE, DTLB_PB_MSHR_SIZE};
@@ -117,6 +151,48 @@ class O3_CPU {
     MEMORY_CONTROLLER *dram_controller;
     
     PAGE_TABLE_WALKER PTW{"PTW"}; 
+
+    // DDRP MONITOR
+    DDRPMonitor *ddrp_monitor;
+
+    // trace cache for previously decoded instructions
+
+    // some stats
+    struct
+    {
+        struct
+        {
+            uint64_t called;
+            uint64_t rob_non_head;
+            uint64_t rob_head;
+            uint64_t went_offchip;
+            uint64_t went_offchip_rob_head;
+            uint64_t went_offchip_rob_non_head;
+        } bubble;
+
+        struct
+        {
+            uint64_t pred_called;
+            uint64_t true_pos;
+            uint64_t false_pos;
+            uint64_t false_neg;
+        } offchip_pred;
+
+        struct
+        {
+            uint64_t total;
+            uint64_t issued[2];
+            uint64_t dram_rq_full;
+            uint64_t dram_mshr_full;
+        } ddrp;
+
+    } stats;
+
+    // bubble stats per ROB partiton
+    vector<uint64_t> bubble_max, bubble_min, bubble_tot, bubble_cnt;
+
+    unordered_map<uint64_t, load_per_ip_info_t> load_per_ip_stats, frontal_load_per_ip_stats;
+    load_per_rob_part_info_t load_per_rob_part_stats[NUM_PARTITION_TYPES];
     
     // off-chip predictor
     OffchipPredBase *offchip_pred;
@@ -257,19 +333,37 @@ class O3_CPU {
      void l1i_prefetcher_final_stats();
      int prefetch_code_line(uint64_t pf_v_addr);
 
-void fill_btb(uint64_t trigger, uint64_t target);
-  // OFFCHIP PREDICTOR
-  void offchip_pred_stats_and_train(uint32_t lq_index);
-  void  initialize_offchip_predictor(uint64_t seed),
-        dump_stats_offchip_predictor(),
-        print_config_offchip_predictor(),
-        offchip_predictor_update_dram_bw(uint8_t dram_bw),
-        offchip_predictor_track_llc_eviction(uint32_t set, uint32_t way, uint64_t address);
+    void fill_btb(uint64_t trigger, uint64_t target);
 
-  // DDRP 
-  void issue_ddrp_request(uint32_t lq_index, uint32_t call_type);
-  void initialize_ddrp_monitor(),
-       print_config_ddrp_monitor();
+    // RBERA: new fuctions
+    uint32_t count_dependency(uint32_t rob_index, std::vector<uint32_t> &cat_dependents);
+    void count_dependency_recursive(uint32_t rob_index, std::bitset<ROB_SIZE> &dependent_rob_indices, std::vector<uint32_t> &cat_dependents, uint32_t level);
+    void debug_dependents(uint32_t rob_index);
+    string rob_to_string();
+    inline int32_t compute_rob_position(uint32_t rob_index, uint32_t rob_head) {return (rob_head <= rob_index) ? (rob_index - rob_head) : (ROB_SIZE - rob_head + rob_index);}
+    void measure_pipeline_bubble_stats(uint32_t lq_index, uint32_t rob_index);
+    void monitor_loads(uint32_t lq_index);
+    uint32_t get_rob_parition_id(int32_t rob_pos);
+    bool rob_part_id_is_frontal(uint32_t rob_part_id);
+    bool rob_part_id_is_dorsal(uint32_t rob_part_id);
+    bool rob_pos_is_frontal(int32_t rob_pos);
+    bool rob_pos_is_dorsal(int32_t rob_pos);
+    int8_t rob_part_id_get_part_type(uint32_t rob_part_id);
+    int8_t rob_pos_get_part_type(int32_t rob_pos);
+    uint32_t get_source_index_from_rob(uint32_t rob_index, uint32_t lq_index);
+
+    // OFFCHIP PREDICTOR
+    void offchip_pred_stats_and_train(uint32_t lq_index);
+    void  initialize_offchip_predictor(uint64_t seed),
+            dump_stats_offchip_predictor(),
+            print_config_offchip_predictor(),
+            offchip_predictor_update_dram_bw(uint8_t dram_bw),
+            offchip_predictor_track_llc_eviction(uint32_t set, uint32_t way, uint64_t address);
+
+    // DDRP 
+    
+    void initialize_ddrp_monitor(),
+        print_config_ddrp_monitor();
 
 };
 

@@ -16,6 +16,9 @@ bool spec_intructions_complete;
 const double L1_THRESHOLD = 0.80;
 const double L2_THRESHOLD = 0.20;
 const double LLC_THRESHOLD = 1.0;
+// const double L1_THRESHOLD = 2.0;
+// const double L2_THRESHOLD = 2.0;
+// const double LLC_THRESHOLD = 2.0;
 struct PAGE_SETTING{
     const uint64_t REGION_SIZE = 32 * 1024;
 
@@ -1736,6 +1739,21 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr,
 }
 
 void CACHE::l1d_prefetcher_final_stats()
+{
+
+}
+
+void CACHE::l1d_prefetcher_broadcast_bw(uint8_t bw_level)
+{
+
+}
+
+void CACHE::l1d_prefetcher_broadcast_ipc(uint8_t ipc)
+{
+
+}
+
+void CACHE::l1d_prefetcher_broadcast_acc(uint32_t acc_level)
 {
 
 }

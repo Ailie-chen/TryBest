@@ -1,6 +1,7 @@
 #ifndef CACHE_H
 #define CACHE_H
 #include "dram_controller.h"
+#include<unordered_map>
 #include "memory_class.h"
 //#define PREFETCHER_CLASS_DEBUG
 //#define MEMORY_ACCESS_PATTERN_DEBUG
@@ -8,7 +9,7 @@ extern bool spec_intructions_complete;
 extern bool spec_intructions_complete_for_l2c;
 
 #ifdef MEMORY_ACCESS_PATTERN_DEBUG
-    #include<unordered_map>
+    
     typedef struct act_ValuePair_struct
     {
         uint64_t offset;
@@ -50,6 +51,7 @@ extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
 #define IS_DTLB_PB 8
 #endif
 #define IS_BTB 12
+
 
 // MMU CACHE TYPE
 #define IS_PSCL5  8
@@ -117,7 +119,7 @@ extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
 //#define L1D_PQ_SIZE 16     //	Neelu: Changed from 8 to 16.
 //#define L1D_MSHR_SIZE 16
 // #define L1D_LATENCY 5
-#define L1D_LATENCY 3
+#define L1D_LATENCY 5
 //modify
 #define L1D_PQ_SIZE 16
 #define L1D_MSHR_SIZE 16
@@ -143,7 +145,7 @@ extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
 #define LLC_WQ_SIZE NUM_CPUS*L2C_MSHR_SIZE //48
 #define LLC_PQ_SIZE NUM_CPUS*32  //Neelu: Changed from 32 per core to 64
 #define LLC_MSHR_SIZE NUM_CPUS*64
-#define LLC_LATENCY 20  // 5 (L1I or L1D) + 10 + 20 = 35 cycles
+#define LLC_LATENCY 40  // 5 (L1I or L1D) + 10 + 40 = 55 cycles
 
 // // L1 INSTRUCTION CACHE
 // #define L1I_SET 64
@@ -190,9 +192,9 @@ extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
 // #define LLC_PQ_SIZE NUM_CPUS*32  //Neelu: Changed from 32 per core to 64
 // #define LLC_MSHR_SIZE NUM_CPUS*64
 // #define LLC_LATENCY 30  // 5 (L1I or L1D) + 10 + 20 = 35 cycles
-
-extern MEMORY_CONTROLLER *dram_controller;
+class O3_CPU;
 class CACHE : public MEMORY {
+
   public:
     uint32_t cpu;
     const string NAME;
@@ -203,7 +205,8 @@ class CACHE : public MEMORY {
     uint32_t MAX_READ, MAX_FILL;
     uint32_t reads_available_this_cycle;
     uint8_t cache_type;
-
+    O3_CPU *cpu_ptr;
+ 
     // prefetch stats
     uint64_t pf_requested,
              pf_issued,
@@ -295,12 +298,84 @@ class CACHE : public MEMORY {
              roi_hit[NUM_CPUS][NUM_TYPES],
              roi_miss[NUM_CPUS][NUM_TYPES],
 	     roi_instr_miss[NUM_CPUS][NUM_TYPES];
+            // some stats to collect during cache eviction
+    struct
+    {
+        struct
+        {
+            uint64_t total;
+
+            uint64_t atleast_one_reuse;
+            uint64_t atleast_one_load_reuse;
+            uint64_t atleast_one_reuse_cat[NUM_TYPES];
+
+            uint64_t all_reuse_total;
+            uint64_t all_reuse_max;
+            uint64_t all_reuse_min;
+
+            uint64_t cat_reuse_total[NUM_TYPES];
+            uint64_t cat_reuse_max[NUM_TYPES];
+            uint64_t cat_reuse_min[NUM_TYPES];
+
+            uint64_t reuse_only_frontal;
+            uint64_t reuse_only_dorsal;
+            uint64_t reuse_only_none;
+            uint64_t reuse_mixed;
+
+            // all dependents
+            uint64_t dep_all_total;
+            uint64_t dep_all_max;
+            uint64_t dep_all_min;
+            // mispredicted branch dependents
+            uint64_t dep_branch_mispred_total;
+            uint64_t dep_branch_mispred_max;
+            uint64_t dep_branch_mispred_min;
+            // all branch dependents
+            uint64_t dep_branch_total;
+            uint64_t dep_branch_max;
+            uint64_t dep_branch_min;
+            // load dependents
+            uint64_t dep_load_total;
+            uint64_t dep_load_max;
+            uint64_t dep_load_min;
+        } eviction;
+
+        struct
+        {
+            uint64_t data_load_misses;
+            uint64_t data_load_miss_eligible_for_pseudo_hit_promotion;
+            uint64_t data_load_miss_promoted_pseudo_hit;
+        } pseudo_perfect;
+
+    } stats;
+    std::unordered_map<uint64_t, uint64_t> dependent_map;
 
     uint64_t total_miss_latency;
+
+    /* For semi-perfect cache */
+    deque<uint64_t> page_buffer;
+
+    /* For cache accuracy measurement */
+    uint64_t cycle, next_measure_cycle;
+    uint64_t pf_useful_epoch, pf_filled_epoch;
+    uint32_t pref_acc;
+    uint64_t total_acc_epochs, acc_epoch_hist[CACHE_ACC_LEVELS];
+
+    CacheTracer tracer;
+
+
+    unordered_map<uint64_t, std::pair<uint64_t, uint64_t> > crit_stats;
+
+    // hitorgram of ROB position of loads missing in cache
+    uint64_t missing_load_rob_pos_hist[ROB_SIZE];
+
+    // To model probabilistic cache hit for performance headroom study
+    std::default_random_engine generator;
+    std::bernoulli_distribution *dist;
     
     // constructor
-    CACHE(string v1, uint32_t v2, int v3, uint32_t v4, uint32_t v5, uint32_t v6, uint32_t v7, uint32_t v8) 
-        : NAME(v1), NUM_SET(v2), NUM_WAY(v3), NUM_LINE(v4), WQ_SIZE(v5), RQ_SIZE(v6), PQ_SIZE(v7), MSHR_SIZE(v8) {
+    CACHE(string v1, uint32_t v2, int v3, uint32_t v4, uint32_t v5, uint32_t v6, uint32_t v7, uint32_t v8, O3_CPU *cpu_ptr) 
+        : NAME(v1), NUM_SET(v2), NUM_WAY(v3), NUM_LINE(v4), WQ_SIZE(v5), RQ_SIZE(v6), PQ_SIZE(v7), MSHR_SIZE(v8),cpu_ptr(cpu_ptr) {
 
         LATENCY = 0;
 
@@ -561,6 +636,13 @@ class CACHE : public MEMORY {
          llc_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in),
          l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in),
          llc_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in);
+    void l1d_prefetcher_print_config(),
+        l2c_prefetcher_print_config(),
+        llc_prefetcher_print_config();
+
+    uint32_t l1d_prefetcher_prefetch_hit(uint64_t addr, uint64_t ip, uint32_t metadata_in),
+            l2c_prefetcher_prefetch_hit(uint64_t addr, uint64_t ip, uint32_t metadata_in),
+            llc_prefetcher_prefetch_hit(uint64_t addr, uint64_t ip, uint32_t metadata_in);
     
     uint32_t get_set(uint64_t address),
              get_way(uint64_t address, uint32_t set),
@@ -579,7 +661,36 @@ class CACHE : public MEMORY {
 
 
              lru_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type);
+
+             // @RBERA new functions
+    void track_stats_from_victim(uint32_t set, uint32_t way);
+    hit_where_t assign_hit_where(uint8_t cache_type, uint32_t where_in_cache);
+    void send_signal_to_core(uint32_t cpu, PACKET packet);
+        
+    bool search_and_add(uint64_t page);
+   
+    void broadcast_bw(uint8_t bw_level),
+        l1d_prefetcher_broadcast_bw(uint8_t bw_level),
+        l2c_prefetcher_broadcast_bw(uint8_t bw_level),
+        llc_prefetcher_broadcast_bw(uint8_t bw_level);
+
+    void broadcast_ipc(uint8_t ipc),
+        l1d_prefetcher_broadcast_ipc(uint8_t ipc),
+        l2c_prefetcher_broadcast_ipc(uint8_t ipc),
+        llc_prefetcher_broadcast_ipc(uint8_t ipc);
+   
+    void handle_prefetch_feedback();
+   
+    void broadcast_acc(uint32_t acc_level),
+        l1d_prefetcher_broadcast_acc(uint32_t bw_level),
+        l2c_prefetcher_broadcast_acc(uint32_t bw_level),
+        llc_prefetcher_broadcast_acc(uint32_t bw_level);
+
+    void issue_ddrp_request(uint32_t lq_index, uint32_t call_type);
 };
+void print_cache_config();
+
+
 
 #ifdef PREFETCHER_CLASS_DEBUG
     //对应的encode版本定义在vbertim.h中

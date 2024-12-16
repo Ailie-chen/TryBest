@@ -5,7 +5,7 @@
 
 namespace knob
 {
-    string offchip_pred_type = "perc";
+    extern string offchip_pred_type ;
     extern bool  offchip_pred_mark_merged_load ;
 }
 

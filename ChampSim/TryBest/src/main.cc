@@ -14,7 +14,27 @@ uint64_t phase_id = 0;
 //#define CAPTURE_DYNAMIC_ENERGY_PROFILE
 //#define IPCP_PREFETCHER
 //#define BINGO_PREFETCHER
+#if 0
+#   define LOCKED(...) {fflush(stdout); __VA_ARGS__; fflush(stdout);}
+#   define LOGID() fprintf(stdout, "[%25s@%3u] ", \
+                            __FUNCTION__, __LINE__ \
+                            );
+#   define MYLOG(...) LOCKED(LOGID(); fprintf(stdout, __VA_ARGS__); fprintf(stdout, "\n");)
+#else
+#   define MYLOG(...) {}
+#endif
 
+namespace knob {
+    bool measure_dram_bw = true ;
+    uint32_t num_rob_partitions = 3;
+	vector<int32_t> rob_partition_size= {64,128,320};
+	vector<int32_t> rob_partition_boundaries = {64, 192};
+    vector<int32_t> rob_frontal_partition_ids = {0};
+    vector<int32_t> rob_dorsal_partition_ids = {2} ;
+
+    
+    uint64_t measure_dram_bw_epoch = 256;
+}
 
 #ifdef CAPTURE_DYNAMIC_ENERGY_PROFILE
 
@@ -1127,7 +1147,14 @@ int main(int argc, char** argv)
     // default: 16 = (64 / 8) * (3200 / 1600)
     // it takes 16 CPU cycles to tranfser 64B cache block on a 8B (64-bit) bus 
     // note that dram burst length = BLOCK_SIZE/DRAM_CHANNEL_WIDTH
-    DRAM_DBUS_RETURN_TIME = (BLOCK_SIZE / DRAM_CHANNEL_WIDTH) * (CPU_FREQ / DRAM_MTPS);
+    DRAM_DBUS_RETURN_TIME = (BLOCK_SIZE / DRAM_CHANNEL_WIDTH) * (1.0 * CPU_FREQ / DRAM_MTPS);
+    cout <<"BLOCK_SIZE" << BLOCK_SIZE <<endl;
+    cout <<"DRAM_CHANNEL_WIDTH" << DRAM_CHANNEL_WIDTH <<endl;
+    cout <<"CPU_FREQ" << CPU_FREQ <<endl;
+    cout <<"DRAM_MTPS" << DRAM_MTPS <<endl;
+
+    cout <<"DRAM_DBUS_RETURN_TIME"<< DRAM_DBUS_RETURN_TIME <<endl;
+    DRAM_DBUS_MAX_CAS = DRAM_CHANNELS * (knob::measure_dram_bw_epoch / DRAM_DBUS_RETURN_TIME);
 
     printf("Off-chip DRAM Size: %u MB Channels: %u Width: %u-bit Data Rate: %u MT/s\n",
             DRAM_SIZE, DRAM_CHANNELS, 8*DRAM_CHANNEL_WIDTH, DRAM_MTPS);
@@ -1772,6 +1799,24 @@ int main(int argc, char** argv)
                 run_simulation = 0;
        
        	}
+        uncore.cycle++;
+        if(knob::measure_dram_bw && uncore.cycle >= uncore.DRAM.next_bw_measure_cycle)
+        {
+            uint64_t this_epoch_enqueue_count = uncore.DRAM.rq_enqueue_count - uncore.DRAM.last_enqueue_count;
+            uncore.DRAM.epoch_enqueue_count = (uncore.DRAM.epoch_enqueue_count/2) + this_epoch_enqueue_count;
+            uint32_t quartile = ((float)100*uncore.DRAM.epoch_enqueue_count)/DRAM_DBUS_MAX_CAS;
+            if(quartile <= 25)      uncore.DRAM.bw = 0;
+            else if(quartile <= 50) uncore.DRAM.bw = 1;
+            else if(quartile <= 75) uncore.DRAM.bw = 2;
+            else                    uncore.DRAM.bw = 3;
+            MYLOG("cycle %lu rq_enqueue_count %lu last_enqueue_count %lu epoch_enqueue_count %lu QUARTILE %u", uncore.cycle, uncore.DRAM.rq_enqueue_count, uncore.DRAM.last_enqueue_count, uncore.DRAM.epoch_enqueue_count, uncore.DRAM.bw);
+            uncore.DRAM.last_enqueue_count = uncore.DRAM.rq_enqueue_count;
+            uncore.DRAM.next_bw_measure_cycle = uncore.cycle + knob::measure_dram_bw_epoch;
+            uncore.DRAM.total_bw_epochs++;
+            uncore.DRAM.bw_level_hist[uncore.DRAM.bw]++;
+            uncore.LLC.broadcast_bw(uncore.DRAM.bw);
+            for(uint32_t i = 0; i < NUM_CPUS; ++ i) ooo_cpu[i].offchip_predictor_update_dram_bw(uncore.DRAM.bw);
+        }
 
         // TODO: should it be backward?
         uncore.LLC.operate();

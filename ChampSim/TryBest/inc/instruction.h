@@ -1,5 +1,8 @@
 #ifndef INSTRUCTION_H
 #define INSTRUCTION_H
+#include <string>
+#include <sstream>
+#include <iomanip>
 
 
 // instruction format
@@ -111,10 +114,13 @@ class ooo_model_instr {
              event_cycle,
 	     stall_begin_cycle,	//Neelu: Adding to count number of stall cycles in ROB
 	     load_stall_begin_cycle,
-	     stall_begin_rob_occupancy;	//Neelu: Adding to capture ROB occupancy at stall start.
+	     stall_begin_rob_occupancy,	//Neelu: Adding to capture ROB occupancy at stall start.
+         rob_head_cycle; // when the instruction became ROB head
 
     uint8_t is_branch,
             is_memory,
+            is_load,
+            is_store,
             branch_taken,
             branch_mispredicted,
 	    branch_prediction_made,
@@ -138,7 +144,7 @@ class ooo_model_instr {
     uint64_t branch_target;     
 
     uint32_t fetched, scheduled;
-    int num_reg_ops, num_mem_ops, num_reg_dependent;
+    int num_reg_ops, num_mem_ops,  num_mem_src, num_mem_dest, num_reg_dependent;
 
     // executed bit is set after all dependencies are eliminated and this instr is chosen on a cycle, according to EXEC_WIDTH
     int executed;
@@ -176,6 +182,8 @@ class ooo_model_instr {
              sq_index[NUM_INSTR_DESTINATIONS_SPARC],
              forwarding_index[NUM_INSTR_DESTINATIONS_SPARC];
 
+             uint8_t mem_source_went_offchip[NUM_INSTR_SOURCES]; // RBERA: to track which memory sources went offchip
+
     ooo_model_instr() {
         instr_id = 0;
         ip = 0;
@@ -186,6 +194,7 @@ class ooo_model_instr {
         execute_begin_cycle = 0;
         retired_cycle = 0;
         event_cycle = 0;
+        rob_head_cycle = 0;
 	stall_begin_cycle = 0;
 	load_stall_begin_cycle = 0;
 	stall_begin_rob_occupancy = 0;
@@ -195,9 +204,11 @@ class ooo_model_instr {
 
         is_branch = 0;
         is_memory = 0;
+        is_load = 0;
+        is_store = 0;
         branch_taken = 0;
         branch_mispredicted = 0;
-	branch_prediction_made = 0;
+	    branch_prediction_made = 0;
         translated = 0;
         data_translated = 0;
         is_producer = 0;
@@ -221,6 +232,8 @@ class ooo_model_instr {
 
         num_reg_ops = 0;
         num_mem_ops = 0;
+        num_mem_src = 0;
+        num_mem_dest = 0;
         num_reg_dependent = 0;
 
         for (uint32_t i=0; i<NUM_INSTR_SOURCES; i++) {
@@ -230,6 +243,7 @@ class ooo_model_instr {
             source_added[i] = 0;
             lq_index[i] = UINT32_MAX;
             reg_RAW_checked[i] = 0;
+            mem_source_went_offchip[i] = 0;
         }
 
         for (uint32_t i=0; i<NUM_INSTR_DESTINATIONS_SPARC; i++) {
@@ -251,6 +265,59 @@ class ooo_model_instr {
         }
 #endif
     };
+
+     string to_string()
+    {
+        stringstream ss;
+
+        ss << "|"
+            << hex << std::setw(8) << instr_id << dec << "|"
+            << hex << std::setw(8) << (uint64_t)ip << dec << "|"
+            << "<" << (uint32_t)is_branch << "-" << (uint32_t)branch_mispredicted << "-" << (uint32_t)branch_taken << ">"
+            << "<" << (uint32_t)is_producer << "-" << (uint32_t)is_consumer << "-" << (uint32_t)reg_RAW_producer << ">"
+            << "<" << (uint64_t)is_memory << "-" << (uint32_t)is_load << "-" << (uint32_t)is_store << ">"
+            << "|";
+
+        for(uint32_t i=0; i<NUM_INSTR_SOURCES; i++)
+        {
+            if(i) ss << ",";
+            ss << std::setw(2) << (uint32_t)source_registers[i];
+        }
+        ss << "|";
+        
+        for(uint32_t i=0; i<NUM_INSTR_SOURCES; i++)
+        {
+            if(i) ss << ",";
+            ss << hex << std::setw(8) << (uint32_t)source_memory[i] << dec;
+        }
+        ss << "|";
+        
+        for(uint32_t i=0; i<NUM_INSTR_DESTINATIONS; i++)
+        {
+            if(i) ss << ",";
+            ss << std::setw(2) << (uint32_t)destination_registers[i];
+        }
+        ss << "|";
+        
+        for(uint32_t i=0; i<NUM_INSTR_DESTINATIONS; i++)
+        {
+            if(i) ss << ",";
+            ss << hex << std::setw(8) << (uint32_t)destination_memory[i] << dec;
+        }
+        ss << "|";
+
+        ss << hex << std::setw(8) << producer_id << dec;
+        ss << "|";
+
+        ITERATE_SET(i, registers_instrs_depend_on_me, ROB_SIZE)
+        {
+            if(i) ss << ",";
+            ss << std::setw(3) << i;
+        }
+        ss << "|";
+        
+        return ss.str();
+    }
 };
 
 #endif

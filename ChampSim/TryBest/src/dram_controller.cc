@@ -4,9 +4,21 @@
 #include "ooo_cpu.h"
 #include "uncore.h"
 #include "util.h"
-
+namespace knob
+{
+    bool     enable_pseudo_direct_dram_prefetch = false;
+    bool     enable_pseudo_direct_dram_prefetch_on_prefetch = false ;
+    uint32_t pseudo_direct_dram_prefetch_rob_part_type = 0;;
+    extern bool     enable_ddrp;
+    uint32_t dram_rq_schedule_type = FR_FCFS;
+    bool     dram_force_rq_row_buffer_miss = false;
+    bool     dram_cntlr_enable_ddrp_buffer = true;
+    uint32_t dram_cntlr_ddrp_buffer_sets = 64;
+    uint32_t dram_cntlr_ddrp_buffer_assoc = 16;
+    uint32_t dram_cntlr_ddrp_buffer_hash_type = 2;
+}
 // initialized in main.cc
-uint32_t DRAM_MTPS, DRAM_DBUS_RETURN_TIME,
+uint32_t DRAM_MTPS, DRAM_DBUS_RETURN_TIME, DRAM_DBUS_MAX_CAS,
          tRP, tRCD, tCAS;
 
 
@@ -348,42 +360,56 @@ void MEMORY_CONTROLLER::schedule(PACKET_QUEUE *queue)
             }
         }
     }
-
+    if(queue->is_RQ && knob::dram_force_rq_row_buffer_miss)
+    {
+        row_buffer_hit = 0;
+    }
     // at this point, the scheduler knows which bank to access and if the request is a row buffer hit or miss
     if (oldest_index != -1) { // scheduler might not find anything if all requests are already scheduled or all banks are busy
 
-        uint64_t LATENCY = 0;
-        if (row_buffer_hit)  
-            LATENCY = tCAS;
-        else 
-            LATENCY = tRP + tRCD + tCAS;
+        
 
         uint64_t op_addr = queue->entry[oldest_index].address;
         uint32_t op_cpu = queue->entry[oldest_index].cpu,
+                 op_rob_pos = queue->entry[oldest_index].rob_position,
                  op_channel = dram_get_channel(op_addr), 
                  op_rank = dram_get_rank(op_addr), 
                  op_bank = dram_get_bank(op_addr), 
                  op_row = dram_get_row(op_addr);
 #ifdef DEBUG_PRINT
         uint32_t op_column = dram_get_column(op_addr);
-#endif // model pseudo direct DRAM prefetch
-        if(queue->entry[oldest_index].is_data)
+
+#endif 
+        uint64_t LATENCY = 0;
+        if (row_buffer_hit)  
+            LATENCY = tCAS;
+        else 
+            LATENCY = tRP + tRCD + tCAS;
+
+        // model pseudo direct DRAM prefetch
+        if(knob::enable_pseudo_direct_dram_prefetch && queue->entry[oldest_index].is_data)
         {
             // model only for loads, and also for prefetch requests if enabled
-            if(queue->entry[oldest_index].type == LOAD || (queue->entry[oldest_index].type == PREFETCH ))
+            if(queue->entry[oldest_index].type == LOAD || (queue->entry[oldest_index].type == PREFETCH && knob::enable_pseudo_direct_dram_prefetch_on_prefetch))
             {
-                
-                uint64_t on_chip_cache_lookup_lat = L1D_LATENCY + L2C_LATENCY + LLC_LATENCY;
-                if(LATENCY > on_chip_cache_lookup_lat)
+                uint8_t op_rob_part_type = ooo_cpu[op_cpu].rob_pos_get_part_type(op_rob_pos);
+                if(knob::pseudo_direct_dram_prefetch_rob_part_type == NUM_PARTITION_TYPES 
+                    || (uint32_t)op_rob_part_type == knob::pseudo_direct_dram_prefetch_rob_part_type)
                 {
-                    LATENCY = LATENCY - on_chip_cache_lookup_lat;
-                }
-                else
-                {
-                    // the real headroom might be even higher than this
-                    // when total on-chip cache lookup latency will be much higher 
-                    // than the row buffer hit latency
-                    LATENCY = 0;
+                    uint64_t on_chip_cache_lookup_lat = L1D_LATENCY + L2C_LATENCY + LLC_LATENCY;
+                    if(LATENCY > on_chip_cache_lookup_lat)
+                    {
+                        LATENCY = LATENCY - on_chip_cache_lookup_lat;
+                        stats.pseudo_direct_dram_prefetch.reduced_lat++;
+                    }
+                    else
+                    {
+                        // the real headroom might be even higher than this
+                        // when total on-chip cache lookup latency will be much higher 
+                        // than the row buffer hit latency
+                        LATENCY = 0;
+                        stats.pseudo_direct_dram_prefetch.zero_lat++;
+                    }
                 }
             }
         }
@@ -411,6 +437,12 @@ void MEMORY_CONTROLLER::schedule(PACKET_QUEUE *queue)
 
         queue->entry[oldest_index].scheduled = 1;
         queue->entry[oldest_index].event_cycle = current_core_cycle[op_cpu] + LATENCY;
+        if(queue->entry[oldest_index].is_data && queue->entry[oldest_index].type == LOAD)
+        {
+            stats.data_loads.total_loads++;
+            uint8_t op_rob_part_type = ooo_cpu[op_cpu].rob_pos_get_part_type(op_rob_pos);
+            stats.data_loads.load_cat[op_rob_part_type]++;
+        }
 
         update_schedule_cycle(queue);
         update_process_cycle(queue);
@@ -489,8 +521,33 @@ void MEMORY_CONTROLLER::process(PACKET_QUEUE *queue)
                 if(queue->entry[request_index].fill_level < FILL_DDRP)
                 {                
                     upper_level_dcache[op_cpu]->return_data(&queue->entry[request_index]);
-                }else{
-                    insert_ddrp_buffer(op_addr);
+                    stats.dram_process.returned[queue->entry[request_index].type]++;
+
+                    DDRP_DP ( if (warmup_complete[op_cpu]) {
+                    cout << "[" << queue->NAME << "] " <<  __func__ << " return data";
+                    cout << " instr_id: " << queue->entry[request_index].instr_id << " address: " << hex << queue->entry[request_index].address << dec;
+                    cout << " full_addr: " << hex << queue->entry[request_index].full_addr << dec << " type: " << +queue->entry[request_index].type << " fill_level: " << queue->entry[request_index].fill_level;
+                    cout << " current_cycle: " << current_core_cycle[op_cpu] << " event_cycle: " << queue->entry[request_index].event_cycle << endl; });
+                }
+                else
+                {
+                    assert(queue->entry[request_index].type == PREFETCH); // this has to be a DDRP prefetch
+                    // if DDRP buffer is enabled, put this otherwise wasted request there
+                    if(knob::dram_cntlr_enable_ddrp_buffer)
+                    {
+                        stats.dram_process.buffered++;
+                        insert_ddrp_buffer(op_addr);
+                        DDRP_DP ( if (warmup_complete[op_cpu]) {
+                        cout << "[" << queue->NAME << "] " <<  __func__ << " buffering_data";
+                        cout << " instr_id: " << queue->entry[request_index].instr_id << " address: " << hex << queue->entry[request_index].address << dec;
+                        cout << " full_addr: " << hex << queue->entry[request_index].full_addr << dec << " type: " << +queue->entry[request_index].type << " fill_level: " << queue->entry[request_index].fill_level;
+                        cout << " current_cycle: " << current_core_cycle[op_cpu] << " event_cycle: " << queue->entry[request_index].event_cycle << endl; });
+                    }
+                    else
+                    {
+                        // request is wasted
+                        stats.dram_process.not_returned++;
+                    }
                 }
 
                 if (bank_request[op_channel][op_rank][op_bank].row_buffer_hit)
@@ -576,18 +633,21 @@ void MEMORY_CONTROLLER::process(PACKET_QUEUE *queue)
 int MEMORY_CONTROLLER::add_rq(PACKET *packet)
 {
     bool return_data_to_core = true;
-    if(packet->fill_level >= FILL_DDRP)
+    if(knob::enable_ddrp && packet->fill_level >= FILL_DDRP)
     {
         return_data_to_core = false;
     }
 
     // simply return read requests with dummy response before the warmup
-    if (all_warmup_complete < NUM_CPUS) {
+    if (all_warmup_complete < NUM_CPUS  && return_data_to_core) {
         if (packet->instruction) 
             upper_level_icache[packet->cpu]->return_data(packet);
-        else // data
+        if (packet->is_data)
             upper_level_dcache[packet->cpu]->return_data(packet);
-
+        
+        DDRP_DP ( if(warmup_complete[packet->cpu]) {
+        cout << "[" << NAME << "_RQ] " <<  __func__ << " instr_id: " << packet->instr_id << " address: " << hex << packet->address;
+        cout << " full_addr: " << packet->full_addr << dec << " type: " << +packet->type << " fill_level: " << packet->fill_level << " return_data_before_warmup" << endl; });
         return -1;
     }
 
@@ -595,6 +655,8 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
     uint32_t channel = dram_get_channel(packet->address);
     int wq_index = check_dram_queue(&WQ[channel], packet);
     if (wq_index != -1) {
+        if(return_data_to_core)
+        {
         
         // no need to check fill level
         //if (packet->fill_level < fill_level) {
@@ -602,8 +664,9 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
             packet->data = WQ[channel].entry[wq_index].data;
             if (packet->instruction) 
                 upper_level_icache[packet->cpu]->return_data(packet);
-            else // data
+            if (packet->is_data) 
                 upper_level_dcache[packet->cpu]->return_data(packet);
+        }
         //}
 
         DP ( if (packet->cpu) {
@@ -616,29 +679,117 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
         WQ[channel].FORWARD++;
         RQ[channel].ACCESS++;
         //assert(0);
-
+        DDRP_DP ( if(warmup_complete[packet->cpu]) {
+        cout << "[" << NAME << "_RQ] " <<  __func__ << " instr_id: " << packet->instr_id << " address: " << hex << packet->address;
+        cout << " full_addr: " << packet->full_addr << dec << " DRAM_WQ_" << channel << "_FORWARD"; });
         return -1;
     }
-    bool hit = lookup_ddrp_buffer(packet->address);
-    if(hit)
+    // check for possible hit in DDRP buffer
+    if(knob::dram_cntlr_enable_ddrp_buffer)
     {
-        // RBERA_TODO: do we want to model latency here?
-        if (return_data_to_core) 
+        bool hit = lookup_ddrp_buffer(packet->address);
+        if(hit)
         {
-            // RBERA_TODO: what should be the data payload of the packet?
-            if (packet->instruction) 
-                upper_level_icache[packet->cpu]->return_data(packet);
-            if (packet->is_data) 
-                upper_level_dcache[packet->cpu]->return_data(packet);
+            // RBERA_TODO: do we want to model latency here?
+            if (return_data_to_core) 
+            {
+                // RBERA_TODO: what should be the data payload of the packet?
+                if (packet->instruction) 
+                    upper_level_icache[packet->cpu]->return_data(packet);
+                if (packet->is_data) 
+                    upper_level_dcache[packet->cpu]->return_data(packet);
+
+                stats.dram_process.returned[packet->type]++;
+            }
+
+            DDRP_DP ( if(warmup_complete[packet->cpu]) {
+            cout << "[" << NAME << "_RQ] " <<  __func__ << " instr_id: " << packet->instr_id << " address: " << hex << packet->address;
+            cout << " full_addr: " << packet->full_addr << dec << " DDRP_BUFFER_FORWARD"; });
+
+            if(packet->fill_level <= FILL_LLC)
+            {
+                stats.ddrp.llc_miss.ddrp_buffer_hit[packet->type]++;
+                stats.ddrp.llc_miss.total[packet->type]++;
+            }
+            else if(packet->fill_level == FILL_DDRP)
+            {
+                stats.ddrp.ddrp_req.ddrp_buffer_hit++;
+                stats.ddrp.ddrp_req.total++;
+            }
+
+            return -1;
         }
-
-
-        return -1;
     }
     // check for duplicates in the read queue
     int index = check_dram_queue(&RQ[channel], packet);
+    // request should not merge in DRAM's RQ, unless DDRP is turned on
+    assert(index == -1 || knob::enable_ddrp);
     if (index != -1)
+    {
+        DDRP_DP ( if(warmup_complete[packet->cpu]) {
+        cout << "[" << NAME << "_RQ] " <<  __func__ << " instr_id: " << packet->instr_id << " address: " << hex << packet->address;
+        cout << " full_addr: " << packet->full_addr << dec << " LLC_MISS_MERGE_IN_RQ";
+        cout << " occupancy: " << RQ[channel].occupancy << " current: " << current_core_cycle[packet->cpu] << " event: " << packet->event_cycle << endl; });
+
+        stats.rq_merged++;
+        if(RQ[channel].entry[index].fill_level == FILL_DDRP)
+        {
+            if(packet->fill_level <= FILL_LLC) // incoming LLC miss
+            {
+                // RBERA_TODO: properly merge the incoming LLC miss to
+                // the exsisting DDRP request so that we can correctly
+                // return data back to the core
+                uint8_t tmp_scheduled = RQ[channel].entry[index].scheduled;
+                uint64_t tmp_event_cycle = RQ[channel].entry[index].event_cycle;
+                uint64_t tmp_enque_cycle = RQ[channel].entry[index].enque_cycle[IS_DRAM][IS_RQ];
+                RQ[channel].entry[index] = *packet; // merge
+                RQ[channel].entry[index].scheduled = tmp_scheduled;
+                RQ[channel].entry[index].event_cycle = tmp_event_cycle;
+                RQ[channel].entry[index].enque_cycle[IS_DRAM][IS_RQ] = tmp_enque_cycle;
+                stats.ddrp.llc_miss.rq_hit[RQ[channel].entry[index].type]++;
+                stats.ddrp.llc_miss.total[RQ[channel].entry[index].type]++;
+            }
+            else if(packet->fill_level == FILL_DDRP) // incoming DDRP request
+            {
+                ; // no need to do anything, as
+                // this is a DDRP request hitting
+                // another DDRP request in RQ
+                stats.ddrp.ddrp_req.rq_hit[0]++;
+                stats.ddrp.ddrp_req.total++;
+            }
+            else{
+                assert(false);
+                return -2;
+            }
+        }
+        else if(RQ[channel].entry[index].fill_level <= FILL_LLC)
+        {
+            if(packet->fill_level <= FILL_LLC) // incoming LLC miss
+            {
+                // the incoming packet and RQ's packet both cannot be LLC miss requests
+                assert(false);
+                return -2;
+            }
+            else if(packet->fill_level == FILL_DDRP) // incoming DDRP request
+            {
+                ; // no need to upgrade the request, 
+                // as the request that already went
+                // t0 DRAM is requested by core.
+                stats.ddrp.ddrp_req.rq_hit[1]++;
+                stats.ddrp.ddrp_req.total++;
+            }
+            else{
+                assert(false);
+                return -2;
+            }
+        }
+        else{
+            assert(false);
+            return -2;
+        }
+
         return index; // merged index
+    }
 
     // search for the empty index
     for (index=0; index<DRAM_RQ_SIZE; index++) {
@@ -646,6 +797,15 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
             
             RQ[channel].entry[index] = *packet;
             RQ[channel].occupancy++;
+            RQ[channel].entry[index].enque_cycle[IS_DRAM][IS_RQ] = uncore.cycle;
+            rq_enqueue_count++;
+
+            // cout << "[ENQUEUE_" << RQ[channel].NAME << "] " << " id: " << packet->id << " cpu: " << packet->cpu << " instr_id: " << packet->instr_id;
+            // cout << " address: " << hex << packet->address << " full_addr: " << packet->full_addr << dec;
+            // cout << " instruction: " << (uint32_t)packet->instruction << " is_data: " << (uint32_t)packet->is_data; 
+            // cout << " timestamp: " << uncore.cycle;
+            // cout << " packet_enq_timestamp: " << packet->enque_cycle[IS_DRAM][IS_RQ] << " packet_deq_timestamp: " << packet->deque_cycle[IS_DRAM][IS_RQ];
+            // cout << " entry_enq_timestamp: " << RQ[channel].entry[index].enque_cycle[IS_DRAM][IS_RQ] << " entry_deq_timestamp: " << RQ[channel].entry[index].deque_cycle[IS_DRAM][IS_RQ] << endl;
 
 #ifdef DEBUG_PRINT
             uint32_t channel = dram_get_channel(packet->address),
@@ -680,7 +840,16 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
             break;
         }
     }
-
+    if(packet->fill_level <= FILL_LLC)
+    {
+        stats.ddrp.llc_miss.went_to_dram[packet->type]++;
+        stats.ddrp.llc_miss.total[packet->type]++;
+    }
+    else if(packet->fill_level == FILL_DDRP)
+    {
+        stats.ddrp.ddrp_req.went_to_dram++;
+        stats.ddrp.ddrp_req.total++;
+    }
     update_schedule_cycle(&RQ[channel]);
 
     return -1;
@@ -704,6 +873,7 @@ int MEMORY_CONTROLLER::add_wq(PACKET *packet)
             
             WQ[channel].entry[index] = *packet;
             WQ[channel].occupancy++;
+            WQ[channel].entry[index].enque_cycle[IS_DRAM][IS_WQ] = uncore.cycle;
 
 #ifdef DEBUG_PRINT
             uint32_t channel = dram_get_channel(packet->address),
@@ -948,39 +1118,52 @@ void MEMORY_CONTROLLER::init_ddrp_buffer()
     // init buffer
     ddrp_buffer.clear();
     deque<uint64_t> d;
-    ddrp_buffer.resize(64, d);
+    ddrp_buffer.resize(knob::dram_cntlr_ddrp_buffer_sets, d);
 }
 
 void MEMORY_CONTROLLER::insert_ddrp_buffer(uint64_t addr)
 {
-
+    stats.ddrp_buffer.insert.called++;
     uint32_t set = get_ddrp_buffer_set_index(addr);
     auto it = find_if(ddrp_buffer[set].begin(), ddrp_buffer[set].end(), [addr](uint64_t m_addr){return m_addr == addr;});
     if(it != ddrp_buffer[set].end())
     {
         ddrp_buffer[set].erase(it);
         ddrp_buffer[set].push_back(addr);
+        stats.ddrp_buffer.insert.hit++;
     }
     else
     {
-        if(ddrp_buffer[set].size() >= 16)
+        if(ddrp_buffer[set].size() >= knob::dram_cntlr_ddrp_buffer_assoc)
         {
             ddrp_buffer[set].pop_front();
+            stats.ddrp_buffer.insert.evict++;
         }
         ddrp_buffer[set].push_back(addr);
+        stats.ddrp_buffer.insert.insert++;
     }
 }
 
 bool MEMORY_CONTROLLER::lookup_ddrp_buffer(uint64_t addr)
 {
+    stats.ddrp_buffer.lookup.called++;
     uint32_t set = get_ddrp_buffer_set_index(addr);
     auto it = find_if(ddrp_buffer[set].begin(), ddrp_buffer[set].end(), [addr](uint64_t m_addr){return m_addr == addr;});
-
+    if(it != ddrp_buffer[set].end())
+    {
+        stats.ddrp_buffer.lookup.hit++;
+        return true;
+    }
+    else
+    {
+        stats.ddrp_buffer.lookup.miss++;
+        return false;
+    }
 }
 
 uint32_t MEMORY_CONTROLLER::get_ddrp_buffer_set_index(uint64_t address)
 {
     uint32_t hash = folded_xor(address, 2);
-    hash = HashZoo::getHash(2, hash);
-    return (hash % 64);
+    hash = HashZoo::getHash(knob::dram_cntlr_ddrp_buffer_hash_type, hash);
+    return (hash % knob::dram_cntlr_ddrp_buffer_sets);
 }

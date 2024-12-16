@@ -19,3 +19,17 @@ void CACHE::llc_prefetcher_final_stats()
 {
 
 }
+void CACHE::llc_prefetcher_broadcast_bw(uint8_t bw_level)
+{
+
+}
+
+void CACHE::llc_prefetcher_broadcast_ipc(uint8_t ipc)
+{
+
+}
+
+void CACHE::llc_prefetcher_broadcast_acc(uint32_t acc_level)
+{
+
+}

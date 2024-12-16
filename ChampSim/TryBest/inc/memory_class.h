@@ -4,15 +4,7 @@
 #include "champsim.h"
 #include "block.h"
 
-// CACHE ACCESS TYPE
-#define LOAD      0
-#define RFO       1
-#define PREFETCH  2
-#define WRITEBACK 3
-#define LOAD_TRANSLATION 4
-#define PREFETCH_TRANSLATION 5  //Requests coming from TLB prefetcher
-#define TRANSLATION_FROM_L1D 6	//Translation requests coming to STLB when the translation of data prefetch request is missing in DTLB
-#define NUM_TYPES 7
+
 
 extern uint32_t tRP,  // Row Precharge (RP) latency
                 tRCD, // Row address to Column address (RCD) latency

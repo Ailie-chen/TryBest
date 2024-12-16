@@ -1,10 +1,15 @@
 #ifndef BLOCK_H
 #define BLOCK_H
-
+#include <cstring>
+#include <deque>
 #include "champsim.h"
 #include "instruction.h"
 #include "set.h"
+#include "cache_tracer.h"
+#include "commons.h"
 #include "offchip_pred_base_helper.h"
+
+
 
 // CACHE BLOCK
 class BLOCK {
@@ -32,6 +37,14 @@ class BLOCK {
 
     // replacement state
     uint32_t lru;
+    // RBERA: metadata
+    uint32_t reuse[NUM_TYPES];
+    uint32_t dependents;
+    uint32_t cat_dependents[DEP_INSTR_TYPES];
+    bool critical_actual;
+    bool critical_pred;
+    uint64_t fill_ip;
+    uint32_t reuse_frontal_dorsal[NUM_PARTITION_TYPES];
 
     BLOCK() {
         valid = 0;
@@ -56,7 +69,27 @@ class BLOCK {
         instr_id = 0;
 
         lru = 0;
+        reset_metadata();
     };
+    void reset_metadata()
+    {
+        for(uint32_t index = 0; index < NUM_TYPES; ++index) 
+        {
+            reuse[index] = 0;
+        }
+        for(uint32_t index = 0; index < NUM_PARTITION_TYPES; ++index)
+        {
+            reuse_frontal_dorsal[index] = 0;
+        }
+        dependents = 0;
+        for(uint32_t index = 0; index < DEP_INSTR_TYPES; ++index) 
+        {
+            cat_dependents[index] = 0;
+        }
+        critical_actual = false;
+        critical_pred = false;
+        fill_ip = 0xdeadbeef;
+    }
 };
 
 // DRAM CACHE BLOCK
@@ -68,10 +101,41 @@ class DRAM_ARRAY {
         block = NULL;
     };
 };
+typedef enum
+{
+    INV = 0,
+    ITLB,
+    ITLB_MSHR,
+    DTLB,
+    DTLB_MSHR,
+    STLB, // STLB does not have MSHR. Anything that misses STLB directly emiulates PTW
+    PTW,
+    L1I,
+    L1I_RQ,
+    L1I_WQ,
+    L1I_MSHR,
+    L1D,
+    L1D_RQ,
+    L1D_WQ,
+    L1D_MSHR,
+    L2C,
+    L2C_RQ,
+    L2C_WQ,
+    L2C_MSHR,
+    LLC,
+    LLC_RQ,
+    LLC_WQ,
+    LLC_MSHR,
+    DRAM,
+
+    NumHitWheres
+} hit_where_t;
 
 // message packet
 class PACKET {
   public:
+    uint64_t id; // just a packet id
+    static uint64_t next_id;
     uint8_t instruction,
 	    is_data,
 	    fill_l1i,
@@ -88,12 +152,17 @@ class PACKET {
         pf_origin_level,
         rob_signal, 
         rob_index, 
+        rob_position,
         producer,
         delta,
         depth,
         signature,
         confidence,
-	late_pref;
+        late_pref;
+
+    int8_t rob_part_type;
+
+    hit_where_t hit_where;
 
     uint32_t pf_metadata;
 
@@ -145,7 +214,9 @@ class PACKET {
              prefetch_id,//@v
              ip, 
              event_cycle,
-             cycle_enqueued;
+             cycle_enqueued,
+             enque_cycle[NUM_MODULE_TYPES][NUM_QUEUE_TYPES],
+             deque_cycle[NUM_MODULE_TYPES][NUM_QUEUE_TYPES];
     
     uint8_t went_offchip_pred;
 
@@ -176,12 +247,15 @@ class PACKET {
 		pf_origin_level = -1; 
         rob_signal = -1;
         rob_index = -1;
+        rob_position = -1;
         producer = -1;
         delta = 0;
         depth = 0;
         signature = 0;
         confidence = 0;
+        rob_part_type = -1;
 
+        hit_where = hit_where_t::INV;
 #if 0
         for (uint32_t i=0; i<ROB_SIZE; i++) {
             rob_index_depend_on_me[i] = 0;
@@ -207,7 +281,15 @@ class PACKET {
         prefetch_id = 0,//@v
         ip = 0;
         event_cycle = UINT64_MAX;
-	cycle_enqueued = 0;
+        cycle_enqueued = 0;
+        for(uint32_t i = 0; i < NUM_MODULE_TYPES; ++i)
+        {
+            for(uint32_t j = 0; j < NUM_QUEUE_TYPES; ++j)
+            {
+                enque_cycle[i][j] = 0;
+                deque_cycle[i][j] = 0;
+            }
+        }
 
 
 	read_translation_merged = 0;
@@ -221,11 +303,13 @@ class PACKET {
 
     went_offchip_pred = 0;
     };
+    std::string to_string();
 };
 
 // packet queue， wq，rq，pref_q和MSHR，processed queue的定义类
 // 对于每一个cache都包含了上面说的几个队列
-class PACKET_QUEUE {
+class PACKET_QUEUE_BASE 
+{
   public:
     string NAME;
     uint32_t SIZE;
@@ -254,10 +338,19 @@ class PACKET_QUEUE {
              ROW_BUFFER_MISS,
              FULL;
 
-    PACKET *entry, processed_packet[2*MAX_READ_PER_CYCLE];
+            PACKET *entry, processed_packet[2*MAX_READ_PER_CYCLE];
 
+        int8_t module_type, queue_type;
+
+            // some stats
+            struct
+            {
+                uint64_t requests_seen[NUM_PARTITION_TYPES];
+                uint64_t total_queueing_delay[NUM_PARTITION_TYPES];
+            } stats;
     // constructor
-    PACKET_QUEUE(string v1, uint32_t v2) : NAME(v1), SIZE(v2) {
+    PACKET_QUEUE_BASE(string v1, uint32_t v2) : NAME(v1), SIZE(v2) 
+    {
         is_RQ = 0;
         is_WQ = 0;
         write_mode = 0;
@@ -284,9 +377,13 @@ class PACKET_QUEUE {
         FULL = 0;
 
         entry = new PACKET[SIZE]; 
-    };
+        module_type = get_module_type();
+        queue_type = get_queue_type();
+        reset_stats();
+    }
 
-    PACKET_QUEUE() {
+    PACKET_QUEUE_BASE() 
+    {
         is_RQ = 0;
         is_WQ = 0;
 
@@ -310,19 +407,160 @@ class PACKET_QUEUE {
         ROW_BUFFER_HIT = 0;
         ROW_BUFFER_MISS = 0;
         FULL = 0;
+        module_type = get_module_type();
+        queue_type = get_queue_type();
+        reset_stats();
 
+    
+        //entry = new PACKET[SIZE]; 
+    }
+    virtual void init(uint32_t size) = 0;
+
+    virtual ~PACKET_QUEUE_BASE() {} // has to be virtual
+
+    void reset_stats()
+    {
+        bzero(&stats, sizeof(stats));
+    }
+
+    int8_t get_module_type();
+    int8_t get_queue_type();
+    void deduce_module_queue_types();
+
+    // to collect and print queueing stats
+    void record_queue_stats(PACKET *packet);
+    void dump_stats();
+
+    // interface functions
+    virtual int check_queue(PACKET* packet, uint64_t timestamp = 0) = 0;
+    virtual int add_queue(PACKET* packet, uint64_t timestamp = 0) = 0;
+    virtual void remove_queue(PACKET* packet, uint64_t timestamp = 0) = 0;
+    virtual bool is_empty() = 0;
+    virtual PACKET& get_entry(int32_t index) = 0;
+    virtual int32_t get_head() = 0;
+    virtual int32_t get_tail() = 0;
+    virtual PACKET& peek() = 0;
+};
+    // basic FIFO packet queue
+class PACKET_QUEUE : public PACKET_QUEUE_BASE
+{
+public:
+    uint32_t head, tail;
+    PACKET *entry;
+
+    // constructor
+    PACKET_QUEUE(string v1, uint32_t v2) : PACKET_QUEUE_BASE(v1, v2)
+    {
+        head = 0;
+        tail = 0;
+        entry = new PACKET[SIZE];
+    };
+
+    PACKET_QUEUE() : PACKET_QUEUE_BASE()
+    {
+        head = 0;
+        tail = 0;
         //entry = new PACKET[SIZE]; 
     };
 
+    void init(uint32_t size)
+    {
+        SIZE = size;
+        head = 0;
+        tail = 0;
+        entry = new PACKET[SIZE]; 
+    }
+
     // destructor
-    ~PACKET_QUEUE() {
+    virtual ~PACKET_QUEUE() 
+    {
         delete[] entry;
     };
 
-    // functions
-    int check_queue(PACKET* packet);
-    void add_queue(PACKET* packet),
-         remove_queue(PACKET* packet);
+    // override functions
+    int check_queue(PACKET* packet, uint64_t timestamp = 0);
+    int add_queue(PACKET* packet, uint64_t timestamp = 0);
+    void remove_queue(PACKET* packet, uint64_t timestamp = 0);
+    inline bool is_empty() {return entry[head].cpu == NUM_CPUS ? true : false;}
+    inline PACKET& get_entry(int32_t index) {return entry[index];}
+    inline int32_t get_head() {return head;}
+    inline int32_t get_tail() {return tail;}
+    inline PACKET& peek() {return get_entry(get_head());}
+};
+typedef enum
+{
+    FCFS = 0,               // 0
+    ROB_POS_FCFS,           // 1
+    OFFCHIP_FCFS,           // 2
+    OFFCHIP_ROB_POS_FCFS,   // 3
+
+    NumPriorityTypes
+} priority_type_t;
+
+extern string priority_name_string[NumPriorityTypes];
+
+// priority-based packet queue
+class PACKET_QUEUE_PRIORITY : public PACKET_QUEUE_BASE
+{
+public:
+    // head always points to the entry with the highest priority
+    // -1 if occupancy is zero
+    int32_t head;
+    deque<PACKET>::iterator head_iterator; // iterator to head; used in remove_queue()
+    priority_type_t priority_type;
+
+    deque<PACKET> entry;
+
+    // constructors
+    PACKET_QUEUE_PRIORITY(string v1, uint32_t v2, priority_type_t v3) : PACKET_QUEUE_BASE(v1, v2), priority_type(v3)
+    {
+        entry.clear();
+        occupancy = 0;
+        head = -1;
+    }
+
+    PACKET_QUEUE_PRIORITY(priority_type_t v1) : PACKET_QUEUE_BASE(), priority_type(v1)
+    {
+        head = -1;
+        occupancy = 0;
+    }
+
+    void init(uint32_t size)
+    {
+        SIZE = size;
+        entry.clear();
+        occupancy = 0;
+        head = -1;
+    }
+
+    // destructor
+    virtual ~PACKET_QUEUE_PRIORITY()
+    {
+
+    };
+
+    // override functions
+    int check_queue(PACKET* packet, uint64_t timestamp = 0);
+    int add_queue(PACKET* packet, uint64_t timestamp = 0);
+    void remove_queue(PACKET* packet, uint64_t timestamp = 0);
+    inline bool is_empty() {return head == -1 ? true : false;}
+    inline PACKET& get_entry(int32_t index) {return entry[index];}
+    inline int32_t get_head() {return head;}
+    inline int32_t get_tail() {return -1;}
+    inline PACKET& peek() {return get_entry(get_head());}
+    
+private:
+    // returns +1 if packet1 has higher priority than packet2
+    //         -1 if packet1 has lower  priority than packet2
+    //         0 if their priority is same
+    int32_t compare_priorty(PACKET packet1, PACKET packet2);
+    int32_t compare_priorty(deque<PACKET>::iterator it1, deque<PACKET>::iterator it2);
+
+    // different priority comparison functions
+    int32_t priority_FCFS(PACKET packet1, PACKET packet2);
+    int32_t priority_ROB_POS_FCFS(PACKET packet1, PACKET packet2);
+    int32_t priority_OFFCHIP_FCFS(PACKET packet1, PACKET packet2);
+    int32_t priority_OFFCHIP_ROB_POS_FCFS(PACKET packet1, PACKET packet2);
 };
 
 // reorder buffer
@@ -392,7 +630,8 @@ class LSQ_ENTRY {
              event_cycle;
 
     uint32_t rob_index, data_index, sq_index;
-
+    int rob_position;
+    uint8_t rob_part_type;
     uint8_t translated,
             fetched,
             asid[2];
@@ -416,6 +655,8 @@ class LSQ_ENTRY {
         rob_index = 0;
         data_index = 0;
         sq_index = UINT32_MAX;
+        rob_position = -1;
+        rob_part_type = -1;
 
         translated = 0;
         fetched = 0;

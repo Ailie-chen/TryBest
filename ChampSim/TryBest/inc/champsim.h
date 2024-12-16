@@ -19,6 +19,13 @@
 #include <string>
 #include <iomanip>
 
+// #define DDRP_DEBUG_PRINT
+#ifdef DDRP_DEBUG_PRINT
+#define DDRP_DP(x) x
+#else
+#define DDRP_DP(x)
+#endif
+
 // USEFUL MACROS
 //#define DEBUG_PRINT
 #define SANITY_CHECK

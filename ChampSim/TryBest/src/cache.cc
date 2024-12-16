@@ -6,6 +6,12 @@
 #include<vector>
 
 #include<iterator>
+namespace knob
+{
+    bool     measure_cache_acc = 1;
+    uint32_t measure_cache_acc_epoch = 1024;
+
+}
 
 uint64_t l2pf_access = 0;
 uint8_t L2C_BYPASS_KNOB = 0;    //Neelu: Set to 1: Bypass Instructions 2: Bypass Data 3: Bypass All
@@ -1182,6 +1188,7 @@ void CACHE::handle_processed()
 
 
                         RQ.entry[rq_index].full_physical_address = (tlb.PROCESSED.entry[index].data_pa << LOG2_PAGE_SIZE) | (RQ.entry[rq_index].full_addr & ((1 << LOG2_PAGE_SIZE) - 1));
+                        ooo_cpu[cpu].LQ.entry[RQ.entry[rq_index].lq_index].physical_address = RQ.entry[rq_index].full_physical_address;
                     }
 
                     // ADD LATENCY
@@ -1189,6 +1196,10 @@ void CACHE::handle_processed()
                         RQ.entry[rq_index].event_cycle = current_core_cycle[cpu] + LATENCY;
                     else
                         RQ.entry[rq_index].event_cycle += LATENCY;
+
+                    if(tlb.cache_type == IS_DTLB && knob::enable_ddrp){
+                        issue_ddrp_request(RQ.entry[rq_index].lq_index,0);
+                    }
                 }
             }
             else if(tlb.PROCESSED.entry[index].l1_wq_index != -1)
@@ -1281,6 +1292,7 @@ void CACHE::handle_processed()
                             }
 
                             RQ.entry[other_rq_index].full_physical_address = (tlb.PROCESSED.entry[index].data_pa << LOG2_PAGE_SIZE) | (RQ.entry[other_rq_index].full_addr & ((1 << LOG2_PAGE_SIZE) - 1));
+                            ooo_cpu[cpu].LQ.entry[RQ.entry[other_rq_index].lq_index].physical_address = RQ.entry[other_rq_index].full_physical_address;
                         }
 
                         RQ.entry[other_rq_index].event_cycle = current_core_cycle[cpu];
@@ -1289,6 +1301,11 @@ void CACHE::handle_processed()
                             RQ.entry[other_rq_index].event_cycle = current_core_cycle[cpu] + LATENCY;
                         else
                             RQ.entry[other_rq_index].event_cycle += LATENCY;
+                        
+                        
+                        if(tlb.cache_type == IS_DTLB && knob::enable_ddrp){
+                            issue_ddrp_request(RQ.entry[other_rq_index].lq_index,1);
+                        }
 
                         DP ( if (warmup_complete[cpu] ) {
                                 cout << "["<<NAME << "_handle_processed] packet: " << RQ.entry[other_rq_index];
@@ -1459,28 +1476,7 @@ if(cache_type == IS_L1I || cache_type == IS_L1D) //Get completed index in RQ, as
         if(RQ.entry[rq_index].translated == COMPLETED && (RQ.entry[rq_index].event_cycle <= current_core_cycle[cpu])) 
         {
             reads_ready.insert({RQ.entry[rq_index].event_cycle, rq_index});
-            if(RQ.entry[rq_index].went_offchip_pred && knob::enable_ddrp && cache_type == IS_L1D){
-                assert(RQ.entry[rq_index].translated == COMPLETED);
-                assert(RQ.entry[rq_index].full_physical_address != 0);
-            // data_packet.rob_position = LQ.entry[lq_index].rob_position;
-                PACKET data_packet;
-                data_packet.fill_level = FILL_DDRP;
-                data_packet.fill_l1d = 0;
-                data_packet.cpu = cpu;
-                data_packet.data_index = RQ.entry[rq_index].data_index;
-                data_packet.lq_index = RQ.entry[rq_index].lq_index;
-                data_packet.address = RQ.entry[rq_index].full_physical_address >> LOG2_BLOCK_SIZE;
-                data_packet.full_addr = RQ.entry[rq_index].full_physical_address;
-                data_packet.instr_id = RQ.entry[rq_index].instr_id;
-                data_packet.rob_index = RQ.entry[rq_index].rob_index;
-                // data_packet.rob_position = RQ.entry[rq_index].rob_position;
-                data_packet.ip = RQ.entry[rq_index].ip;
-                data_packet.type = PREFETCH;
-                data_packet.asid[0] = RQ.entry[rq_index].asid[0];
-                data_packet.asid[1] = RQ.entry[rq_index].asid[1];
-                data_packet.event_cycle = RQ.entry[rq_index].event_cycle + knob::ddrp_req_latency;
-                dram_controller->add_rq(&data_packet);
-            }
+
         }
 
 }
@@ -4362,6 +4358,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                 cerr << " send_both_tlb: " << unsigned(packet->send_both_tlb) << endl;
                 cerr << " instruction: " << unsigned(packet->instruction) << ", data: " << unsigned(packet->is_data) << endl;
                 cerr << " fill_l1d: " << unsigned(packet->fill_l1d) << ", fill_l1i: " << unsigned(packet->fill_l1i) << endl;
+                cerr << " packet_info" << (packet->fill_level) << endl;
                 assert(0);
             }
 
@@ -4676,3 +4673,122 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
             return;
         }
 #endif
+    void CACHE::issue_ddrp_request(uint32_t lq_index, uint32_t call_type)
+    {
+        LOAD_STORE_QUEUE *LQ = &ooo_cpu[cpu].LQ;
+        // stats.ddrp.total++;
+        assert(LQ->entry[lq_index].translated == COMPLETED);
+        assert(LQ->entry[lq_index].physical_address != 0);
+        assert(knob::enable_ddrp); 
+
+        if(cpu_ptr->dram_controller->get_occupancy(1, LQ->entry[lq_index].physical_address >> LOG2_BLOCK_SIZE) == cpu_ptr->dram_controller->get_size(1, LQ->entry[lq_index].physical_address >> LOG2_BLOCK_SIZE)) // check RQ's occupancy
+        {
+            cpu_ptr->stats.ddrp.dram_rq_full++;
+            return;
+        }
+        
+        // add it to DRAM_CONTROLLER's MSHR
+        PACKET data_packet;
+        data_packet.fill_level = FILL_DDRP;
+        data_packet.fill_l1d = 0;
+        data_packet.cpu = cpu;
+        data_packet.data_index = LQ->entry[lq_index].data_index;
+        data_packet.lq_index = lq_index;
+        data_packet.address = LQ->entry[lq_index].physical_address >> LOG2_BLOCK_SIZE;
+        data_packet.full_addr = LQ->entry[lq_index].physical_address;
+        data_packet.instr_id = LQ->entry[lq_index].instr_id;
+        data_packet.rob_index = LQ->entry[lq_index].rob_index;
+        data_packet.rob_position = LQ->entry[lq_index].rob_position;
+        data_packet.rob_part_type = LQ->entry[lq_index].rob_part_type;
+        data_packet.ip = LQ->entry[lq_index].ip;
+        data_packet.type = PREFETCH;
+        data_packet.asid[0] = LQ->entry[lq_index].asid[0];
+        data_packet.asid[1] = LQ->entry[lq_index].asid[1];
+        data_packet.event_cycle = LQ->entry[lq_index].event_cycle + knob::ddrp_req_latency;
+
+        // DDRP_DP ( if(warmup_complete[data_packet.cpu]){
+        // cout << "[CORE_DDRP_REQ] " <<  __func__ << " instr_id: " << data_packet.instr_id << " address: " << hex << data_packet.address;
+        // cout << " full_addr: " << data_packet.full_addr << dec;
+        // cout << " current: " << current_core_cycle[data_packet.cpu] << " event: " << data_packet.event_cycle << endl;});
+
+        cpu_ptr->dram_controller->add_rq(&data_packet);
+    }
+
+void CACHE::broadcast_bw(uint8_t bw_level)
+{
+    /* boradcast to all the attached prefetchers */
+    switch(cache_type)
+    {
+        case IS_L1I:
+            break;
+        case IS_L1D:
+            l1d_prefetcher_broadcast_bw(bw_level);
+            break;
+        case IS_L2C:
+            l2c_prefetcher_broadcast_bw(bw_level);
+            break;
+        case IS_LLC:
+            llc_prefetcher_broadcast_bw(bw_level);
+            break;
+    }
+
+    /* recursively broadcast to higher caches */
+    CACHE *cache = NULL;
+    for(uint32_t core = 0; core < NUM_CPUS; ++core)
+    {
+        if(upper_level_dcache[core])
+        {
+            cache = (CACHE*)upper_level_dcache[core];
+            cache->broadcast_bw(bw_level);
+        }
+        if(upper_level_icache[core] && upper_level_icache[core] != upper_level_dcache[core])
+        {
+            cache = (CACHE*)upper_level_icache[core];
+            cache->broadcast_bw(bw_level);
+        }
+    }
+}
+
+void CACHE::broadcast_ipc(uint8_t ipc)
+{
+    if (cache_type == IS_L1D)
+        l1d_prefetcher_broadcast_ipc(ipc);
+    else if (cache_type == IS_L2C)
+        l2c_prefetcher_broadcast_ipc(ipc);
+    else if (cache_type == IS_LLC)
+        llc_prefetcher_broadcast_ipc(ipc);
+}
+void CACHE::handle_prefetch_feedback()
+{
+    uint32_t this_epoch_accuracy = 0, acc_level = 0;
+
+    cycle++;
+    if(knob::measure_cache_acc && cycle >= next_measure_cycle)
+    {
+        this_epoch_accuracy = pf_filled_epoch ? 100*(float)pf_useful_epoch/pf_filled_epoch : 0; 
+        pref_acc = (pref_acc + this_epoch_accuracy) / 2; // have some hysterisis
+        acc_level = (pref_acc / ((float)100/CACHE_ACC_LEVELS)); // quantize into 8 buckets
+        if(acc_level >= CACHE_ACC_LEVELS) acc_level = (CACHE_ACC_LEVELS - 1); // corner cases
+
+        pf_useful_epoch = 0;
+        pf_filled_epoch = 0;
+        next_measure_cycle = cycle + knob::measure_cache_acc_epoch;
+
+        total_acc_epochs++;
+        acc_epoch_hist[acc_level]++;
+
+        broadcast_acc(acc_level);
+    }
+}
+
+void CACHE::broadcast_acc(uint32_t acc_level)
+{
+    /* boradcast to all the attached prefetchers */
+    switch(cache_type)
+    {
+        case IS_L1I:    return; 
+        case IS_L1D:    return l1d_prefetcher_broadcast_acc(acc_level);
+        case IS_L2C:    return l2c_prefetcher_broadcast_acc(acc_level);
+        case IS_LLC:    return llc_prefetcher_broadcast_acc(acc_level);
+    }
+}
